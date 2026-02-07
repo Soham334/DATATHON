@@ -1,0 +1,15 @@
+Timestamp,Frame,TVSI,State,Severity,Trend,Explanation,Flow,Density,Avg_Speed,Congestion_Detected
+2026-02-08 04:09:05,150,0.8583333333333333,Excellent,OPTIMAL,STABLE,"✓✓ OPTIMAL: good flow (10 veh/window), low density (3 vehicles)",10,3,23.946362049003465,False
+2026-02-08 04:09:12,300,1.0,Excellent,OPTIMAL,STABLE,"✓✓ OPTIMAL: good flow (17 veh/window), low density (5 vehicles)",17,5,19.157617936371704,False
+2026-02-08 04:09:20,450,1.0,Excellent,OPTIMAL,IMPROVING,"✓✓ OPTIMAL: good flow (25 veh/window), low density (5 vehicles)",25,5,20.278288506725353,False
+2026-02-08 04:09:27,600,1.0,Excellent,OPTIMAL,STABLE,"✓✓ OPTIMAL: good flow (31 veh/window), low density (3 vehicles)",31,3,16.655657581606036,False
+2026-02-08 04:09:35,750,1.0,Excellent,OPTIMAL,STABLE,"✓✓ OPTIMAL: good flow (36 veh/window), low density (4 vehicles)",36,4,20.383139002312255,False
+2026-02-08 04:09:42,900,0.7932023460587877,Excellent,OPTIMAL,DEGRADING,"✓✓ OPTIMAL: good flow (42 veh/window), low density (7 vehicles)",42,7,14.293378977152717,False
+2026-02-08 04:09:50,1050,0.4315078153462347,Excellent,OPTIMAL,DEGRADING,✓✓ OPTIMAL: good flow (45 veh/window),45,9,11.155858200251421,False
+2026-02-08 04:09:57,1200,1.0,Excellent,OPTIMAL,IMPROVING,✓✓ OPTIMAL: good flow (51 veh/window),51,8,11.483010648329055,False
+2026-02-08 04:10:05,1350,0.8000000000000004,Excellent,OPTIMAL,IMPROVING,✓✓ OPTIMAL: good flow (56 veh/window),56,9,13.89227807907511,False
+2026-02-08 04:10:13,1500,5.273559366969494e-16,Stable Flow,NORMAL,DEGRADING,"✓ STABLE: 11 vehicles, flow 60, 13 km/h",60,11,13.343838003825036,False
+2026-02-08 04:10:20,1650,0.4,Excellent,OPTIMAL,DEGRADING,✓✓ OPTIMAL: good flow (68 veh/window),68,10,13.595805080681119,False
+2026-02-08 04:10:33,1800,1.0,Excellent,OPTIMAL,IMPROVING,"✓✓ OPTIMAL: good flow (72 veh/window), low density (7 vehicles)",72,7,11.400059071123119,False
+2026-02-08 04:10:40,1950,1.0,Excellent,OPTIMAL,IMPROVING,"✓✓ OPTIMAL: good flow (76 veh/window), low density (6 vehicles)",76,6,12.833056232764573,False
+2026-02-08 04:10:48,2100,1.0,Excellent,OPTIMAL,STABLE,✓✓ OPTIMAL: good flow (82 veh/window),82,8,12.493358217058866,False

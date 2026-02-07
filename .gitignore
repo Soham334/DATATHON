@@ -1,0 +1,18 @@
+# virtual environment
+.venv/
+venv/
+
+# python cache
+__pycache__/
+*.pyc
+
+# videos
+*.mp4
+*.avi
+
+# large generated data
+*.xlsx
+traffic_data.csv
+
+# OS
+.DS_Store
