@@ -1,0 +1,17 @@
+"","(1)"
+"Number of unique banks lent by a lending bank","% Of all network banks"
+"Panel A: TTP",
+"0 “Non-lenders”","49.1"
+"1–5 “Small clique lenders”","20.8"
+"6–20 “Medium clique lenders”","13.8"
+"21–90 “Large clique lenders”","16.4"
+"Panel B: PTTP",
+"0 “Non-lenders”","35.0"
+"1–5 “Small clique lenders”","22.3"
+"6–20 “Medium clique lenders”","27.3"
+"21–90 “Large clique lenders”","15.3"
+"Panel C: Differences",
+"0 “Non-lenders”","−14.1"
+"1–5 “Small clique lenders”","1.50"
+"6–20 “Medium clique lenders”","13.5"
+"21–90 “Large clique lenders”","−1.1"
