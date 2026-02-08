@@ -33,13 +33,17 @@ cv2.setNumThreads(4)
 
 class TrafficVitalStabilityIndex:
     """
-    FIXED: Production-Grade TVSI Engine for VEHICLE TRAFFIC ONLY
+    Production-Grade TVSI Engine for VEHICLE TRAFFIC ONLY
     
-    Key Improvements:
-    - Realistic baseline values for actual vehicle traffic
-    - Better density calculations based on ROI vehicle count
-    - Enhanced flow measurement
-    - Proper congestion detection thresholds
+    FIX #1: ROI Clarification
+    - 'density' = vehicles in monitored zone / effective_monitored_area_m2
+    - Monitored zone = full visible frame (no explicit polygon ROI)
+    - roi_area_m2 is a scaling constant for the effective visible area
+    
+    Key Features:
+    - Realistic baseline values for vehicle traffic
+    - Flow = unique vehicle crossings per window (not cumulative)
+    - Amber Alert = rate-of-change early warning (not severity level)
     """
     
     def __init__(
@@ -77,6 +81,16 @@ class TrafficVitalStabilityIndex:
         # Congestion tracking
         self.congestion_events = []
         self.last_congestion_alert = None
+        
+        # AMBER ALERT: Rate-of-change tracking (CRITICAL FIX)
+        self.tvsi_derivative_history = deque(maxlen=10)
+        self.amber_alert_active = False
+        self.amber_alert_timestamp = None
+        self.time_to_congestion_sec = None
+        
+        # ST-GCN simulation (coordination loss detector)
+        self.coordination_score_history = deque(maxlen=20)
+        self.last_stgcn_update = 0
     
     def compute_tvsi(
         self,
@@ -91,26 +105,36 @@ class TrafficVitalStabilityIndex:
         Returns immediate, realistic feedback for vehicle traffic patterns.
         """
         
-        # Compute density based on actual vehicles in ROI
+        # Compute density: vehicles in monitored zone / effective monitored area (m²)
+        # ROI is abstracted as full visible frame; roi_area_m2 is a dataset-agnostic scaling constant
         density = vehicle_count_in_roi / self.roi_area_m2 if self.roi_area_m2 > 0 else 0
         
-        # Compute speed variance
+        # Compute speed variance with defensive handling for edge cases
         if len(speeds) > 2:
-            speed_variance = np.var(speeds)
+            speed_variance = float(np.var(speeds))  # Explicit float for consistency
         elif len(speeds) == 2:
             speed_variance = (speeds[0] - speeds[1]) ** 2 / 2
+        elif len(speeds) == 1:
+            speed_variance = 0.0  # Single vehicle = no variance by definition
         else:
-            speed_variance = 0.0
+            speed_variance = 0.0  # No speeds = assume stable (conservative default)
         
         self.speed_var_history.append(speed_variance)
         smoothed_speed_var = np.mean(self.speed_var_history)
         
-        # Calculate average speed
-        avg_speed = np.mean(speeds) if speeds else 0.0
+        # Calculate average speed (0.0 if no samples - conservative for congestion detection)
+        avg_speed = float(np.mean(speeds)) if len(speeds) > 0 else 0.0
         
-        # BASELINE COLLECTION
+        # FIX #3: BASELINE COLLECTION - Only collect during healthy traffic conditions
+        # SAFEGUARD: Congested samples are excluded because learning from congestion
+        # would inflate baselines, causing future congestion to appear "normal".
         if not self.baseline_initialized:
-            if flow > 0 or vehicle_count_in_roi > 0:  # Only collect when vehicles present
+            is_healthy_sample = (
+                flow >= 2 and  # Minimum healthy flow
+                vehicle_count_in_roi < 15 and  # Below congestion threshold
+                density < self.congestion_density_threshold * 0.8  # Not approaching congestion
+            )
+            if is_healthy_sample:
                 self.flow_baseline_buffer.append(flow)
                 self.density_baseline_buffer.append(density)
                 self.speed_var_baseline_buffer.append(smoothed_speed_var)
@@ -168,8 +192,19 @@ class TrafficVitalStabilityIndex:
         self.tvsi_history.append(tvsi)
         self.state_history.append(state)
         
-        # Calculate trend
+        # Calculate trend AND derivative (CRITICAL FOR AMBER ALERT)
         trend = self._calculate_trend()
+        tvsi_derivative = self._calculate_derivative()
+        self.tvsi_derivative_history.append(tvsi_derivative)
+        
+        # AMBER ALERT: Detect rapid decline BEFORE congestion hits
+        amber_alert, amber_reason, time_to_congestion = self._check_amber_alert(
+            tvsi, tvsi_derivative, density, avg_speed, flow
+        )
+        self.time_to_congestion_sec = time_to_congestion
+        
+        # Generate suggested action
+        suggested_action = self._get_suggested_action(state, severity, amber_alert, density, flow)
         
         return {
             'tvsi': float(tvsi),
@@ -189,7 +224,13 @@ class TrafficVitalStabilityIndex:
             },
             'baseline_ready': self.baseline_initialized,
             'baseline_progress': f"{self.window_count}/{self.baseline_window_size}",
-            'congestion_detected': severity in ["CRITICAL", "SEVERE"]
+            'congestion_detected': severity in ["CRITICAL", "SEVERE"],
+            # NEW: Amber Alert outputs
+            'amber_alert': amber_alert,
+            'amber_reason': amber_reason if amber_alert else None,
+            'time_to_congestion_sec': time_to_congestion,
+            'tvsi_derivative': float(tvsi_derivative),
+            'suggested_action': suggested_action
         }
     
     def _compute_baselines(self):
@@ -311,6 +352,109 @@ class TrafficVitalStabilityIndex:
         else:
             return "STABLE"
     
+    def _calculate_derivative(self) -> float:
+        """Calculate instantaneous TVSI rate of change (units per window)."""
+        if len(self.tvsi_history) < 2:
+            return 0.0
+        return self.tvsi_history[-1] - self.tvsi_history[-2]
+    
+    def _check_amber_alert(
+        self,
+        tvsi: float,
+        tvsi_derivative: float,
+        density: float,
+        avg_speed: float,
+        flow: int
+    ) -> Tuple[bool, str, Optional[float]]:
+        """
+        AMBER ALERT: Rate-of-change early warning system.
+        
+        CORE DEFINITION: "Rapid degradation of traffic stability while recovery is still possible."
+        
+        KEY DISTINCTION:
+        - Amber is triggered by TRAJECTORY (derivative), NOT absolute severity
+        - Amber fires when TVSI is declining rapidly BUT still above critical
+        - This gives operators a window to intervene BEFORE congestion locks in
+        
+        Triggers:
+        1. Rapid TVSI decline (derivative < -0.15) while in warning zone
+        2. Predictive: projected to hit critical within 30 seconds
+        3. Leading indicators (density↑ + speed↓) while in warning zone
+        """
+        amber_active = False
+        reason = ""
+        time_to_congestion = None
+        
+        # Condition 1: Rapid decline detected (CORE AMBER TRIGGER)
+        rapid_decline = tvsi_derivative < -0.15
+        
+        # Condition 2: TVSI in warning zone but NOT yet critical (still recoverable)
+        in_warning_zone = -0.3 < tvsi < 0.2
+        
+        # Condition 3: Leading indicators (supporting evidence, not primary trigger)
+        density_rising = density > self.congestion_density_threshold * 0.7
+        speed_dropping = avg_speed < 35
+        flow_reducing = flow < self.flow_baseline_mean * 0.6
+        
+        # Calculate time to congestion (linear extrapolation)
+        if tvsi_derivative < -0.05 and tvsi > -0.5:
+            # How many windows until TVSI hits -0.5 (critical)?
+            windows_to_critical = (tvsi - (-0.5)) / abs(tvsi_derivative)
+            time_to_congestion = windows_to_critical * 5.0  # 5 sec per window
+        
+        # AMBER ALERT CONDITIONS
+        if rapid_decline and in_warning_zone:
+            amber_active = True
+            reason = f"Rapid TVSI decline ({tvsi_derivative:.2f}/window)"
+        elif in_warning_zone and density_rising and speed_dropping:
+            amber_active = True
+            reason = f"Density↑ ({density:.4f}) + Speed↓ ({avg_speed:.0f}km/h)"
+        elif in_warning_zone and flow_reducing and density_rising:
+            amber_active = True
+            reason = f"Flow collapse ({flow} veh) + Density rising"
+        elif time_to_congestion is not None and time_to_congestion < 30:
+            amber_active = True
+            reason = f"Congestion predicted in {time_to_congestion:.0f}s"
+        
+        # Track amber state
+        if amber_active and not self.amber_alert_active:
+            self.amber_alert_active = True
+            self.amber_alert_timestamp = time.time()
+            print(f"\n🟠 AMBER ALERT ACTIVATED: {reason}")
+        elif not amber_active and self.amber_alert_active:
+            self.amber_alert_active = False
+            print("\n✅ Amber alert cleared")
+        
+        return amber_active, reason, time_to_congestion
+    
+    def _get_suggested_action(
+        self,
+        state: str,
+        severity: str,
+        amber_alert: bool,
+        density: float,
+        flow: int
+    ) -> str:
+        """Generate actionable intervention suggestion."""
+        
+        if severity == "CRITICAL":
+            return "🚨 IMMEDIATE: Activate signal preemption, deploy traffic control"
+        elif severity == "SEVERE":
+            return "⚠️ URGENT: Extend green phase +30s on main corridor"
+        elif amber_alert:
+            if density > self.congestion_density_threshold * 0.8:
+                return "🟠 RECOMMENDED: Reduce inflow - shorten feeder green by 15s"
+            elif flow < self.flow_baseline_mean * 0.5:
+                return "🟠 RECOMMENDED: Check for incidents, prepare alternate routing"
+            else:
+                return "🟠 MONITOR: Prepare intervention, congestion developing"
+        elif severity == "WARNING":
+            return "⚡ ADVISORY: Monitor closely, prepare signal timing adjustment"
+        elif severity == "CAUTION":
+            return "→ WATCH: Minor slowdown, no action needed yet"
+        else:
+            return "✓ OPTIMAL: No intervention required"
+    
     def _log_congestion_event(self, flow: int, density: float, avg_speed: float, state: str, vehicle_count: int):
         """Log congestion event."""
         now = time.time()
@@ -330,6 +474,47 @@ class TrafficVitalStabilityIndex:
         self.congestion_events.append(event)
         
         print(f"\n🚨 CONGESTION: {state} | {vehicle_count} vehicles | Density: {density:.4f}/m² | Speed: {avg_speed:.1f} km/h")
+    
+    def simulate_stgcn_anomaly(self, speeds: List[float], density: float) -> float:
+        """
+        Simulate ST-GCN coordination loss signal.
+        
+        In production, this would come from actual ST-GCN model.
+        For demo, we simulate based on observable patterns:
+        - High speed variance = loss of coordination (primary signal)
+        - Bi-modal speed distribution = lane blocking
+        - Density contributes minimally to avoid feedback loop
+        """
+        if len(speeds) < 3:
+            return 0.0
+        
+        # Speed variance component (normalized) - PRIMARY SIGNAL
+        speed_std = np.std(speeds)
+        variance_signal = min(speed_std / 30.0, 1.0)  # Cap at 1.0
+        
+        # FIX #4: Density spike component - CAPPED to prevent density→stgcn→tvsi feedback
+        # Density already affects TVSI directly via norm_density and congestion_penalty.
+        # Here we only allow density to contribute to anomaly at EXTREME spikes (3x threshold),
+        # and hard-cap at 0.4 to prevent double-penalization through stgcn_anomaly.
+        density_signal = min(density / (self.congestion_density_threshold * 3 + 1e-9), 0.4)  # +1e-9 prevents div/0
+        
+        # Bi-modality detection (simple: check if speeds cluster in 2 groups)
+        if len(speeds) >= 5:
+            sorted_speeds = np.sort(speeds)
+            mid = len(sorted_speeds) // 2
+            gap = sorted_speeds[mid] - sorted_speeds[mid-1] if mid > 0 else 0
+            bimodal_signal = min(gap / 20.0, 1.0) if gap > 10 else 0.0
+        else:
+            bimodal_signal = 0.0
+        
+        # Combine signals - speed variance dominates to reduce density coupling
+        stgcn_anomaly = 0.5 * variance_signal + 0.25 * density_signal + 0.25 * bimodal_signal
+        
+        # Add temporal smoothing
+        self.coordination_score_history.append(stgcn_anomaly)
+        smoothed = np.mean(self.coordination_score_history)
+        
+        return float(np.clip(smoothed, 0.0, 1.0))
 
 
 # =============================================================================
@@ -358,7 +543,8 @@ class TVSIIntegration:
         
         # Window state
         self.current_window_frames = 0
-        self.window_crossed_ids = set()
+        self.window_crossed_ids = set()  # Vehicles that crossed DURING this window only
+        self.counted_before_window = set()  # FIX #2: Snapshot of counted_ids at window start
         self.window_speeds = []
         self.window_vehicle_counts = []
         self.latest_tvsi_result = None
@@ -367,35 +553,47 @@ class TVSIIntegration:
         self,
         current_detections: Any,
         counted_ids: set,
-        track_history: dict,
-        stgcn_anomaly: float = 0.0
+        track_history: dict
     ) -> Optional[Dict[str, Any]]:
-        """Update with current frame data."""
+        """Update with current frame data. ST-GCN anomaly is computed internally."""
         
         self.current_window_frames += 1
         
-        # Count VEHICLES in ROI
-        vehicles_in_roi = len(current_detections) if current_detections is not None and len(current_detections) > 0 else 0
-        self.window_vehicle_counts.append(vehicles_in_roi)
+        # FIX #2: Initialize window snapshot on first frame of window
+        if self.current_window_frames == 1:
+            self.counted_before_window = counted_ids.copy()  # Snapshot at window start
         
-        # Collect speeds from VEHICLE tracks
+        # FIX #1: Count vehicles in monitored zone (full frame acts as ROI)
+        # Density = vehicles visible / effective_monitored_area
+        vehicles_in_monitored_zone = len(current_detections) if current_detections is not None and len(current_detections) > 0 else 0
+        self.window_vehicle_counts.append(vehicles_in_monitored_zone)
+        
+        # FIX #5: Collect trend-based speeds from vehicle tracks
+        # Speed is computed from first-to-last position in track history (smoothed trend, not instantaneous)
         if current_detections is not None and len(current_detections) > 0:
-            for track_id in current_detections.tracker_id:
+            # DEFENSIVE: Ensure tracker_id array exists and is iterable
+            tracker_ids = current_detections.tracker_id if current_detections.tracker_id is not None else []
+            for track_id in tracker_ids:
+                if track_id is None:
+                    continue  # Skip invalid track IDs
                 if track_id in track_history and len(track_history[track_id]) >= 2:
-                    x_prev, y_prev, t_prev = track_history[track_id][0]
-                    x_curr, y_curr, t_curr = track_history[track_id][-1]
+                    x_prev, y_prev, t_prev = track_history[track_id][0]  # First recorded position
+                    x_curr, y_curr, t_curr = track_history[track_id][-1]  # Latest position
                     
                     dist_pixels = np.hypot(x_curr - x_prev, y_curr - y_prev)
                     dist_meters = dist_pixels * 0.05
                     time_sec = t_curr - t_prev
                     
-                    if time_sec > 0:
+                    # DEFENSIVE: Avoid division by zero on stationary or same-frame detections
+                    if time_sec > 0.01:  # Minimum 10ms between samples
                         speed_kmh = (dist_meters / time_sec) * 3.6
                         if 5 < speed_kmh < 150:  # Reasonable vehicle speed range
                             self.window_speeds.append(speed_kmh)
         
-        # Track crossings
-        new_crossings = counted_ids - self.window_crossed_ids
+        # FIX #2: Track crossings ONLY within this window (not cumulative)
+        # FLOW SEMANTICS: A vehicle can contribute to flow in EXACTLY ONE window.
+        # Once in counted_before_window, it's excluded from all future windows.
+        new_crossings = counted_ids - self.counted_before_window - self.window_crossed_ids
         self.window_crossed_ids.update(new_crossings)
         
         # Check if window complete
@@ -403,11 +601,19 @@ class TVSIIntegration:
             flow = len(self.window_crossed_ids)
             avg_vehicle_count = int(np.mean(self.window_vehicle_counts)) if self.window_vehicle_counts else 0
             
+            # Simulate ST-GCN anomaly signal (replaces hardcoded 0.0)
+            # Uses same roi_area as TVSI engine for consistency
+            density_estimate = avg_vehicle_count / 500.0 if avg_vehicle_count > 0 else 0.0
+            simulated_stgcn = self.tvsi_engine.simulate_stgcn_anomaly(
+                self.window_speeds if self.window_speeds else [],
+                density_estimate
+            )
+            
             result = self.tvsi_engine.compute_tvsi(
                 flow=flow,
                 vehicle_count_in_roi=avg_vehicle_count,
                 speeds=self.window_speeds if self.window_speeds else [],
-                stgcn_anomaly=stgcn_anomaly
+                stgcn_anomaly=simulated_stgcn
             )
             
             result['window_data'] = {
@@ -506,12 +712,26 @@ def draw_tvsi_panel(panel, tvsi_result, x_offset=750, y_start=20):
         cv2.putText(panel, f"Calibrating: {progress}", (x_offset, y_start + 120),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 150, 255), 1)
     
-    # CONGESTION ALERT BANNER
-    if tvsi_result.get('congestion_detected', False):
+    # AMBER ALERT BANNER (NEW: Early warning)
+    if tvsi_result.get('amber_alert', False):
+        cv2.rectangle(panel, (x_offset - 10, y_start + 125), 
+                     (x_offset + 380, y_start + 155), (0, 165, 255), -1)
+        ttc = tvsi_result.get('time_to_congestion_sec')
+        ttc_str = f" | ETA: {ttc:.0f}s" if ttc else ""
+        cv2.putText(panel, f"AMBER ALERT: INTERVENE NOW{ttc_str}", (x_offset, y_start + 145),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 2)
+    # RED CONGESTION ALERT BANNER
+    elif tvsi_result.get('congestion_detected', False):
         cv2.rectangle(panel, (x_offset - 10, y_start + 125), 
                      (x_offset + 350, y_start + 155), (0, 0, 255), -1)
-        cv2.putText(panel, "🚨 CONGESTION DETECTED 🚨", (x_offset, y_start + 145),
+        cv2.putText(panel, "RED ALERT: CONGESTION ACTIVE", (x_offset, y_start + 145),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+    
+    # SUGGESTED ACTION (NEW)
+    action = tvsi_result.get('suggested_action', '')
+    if action:
+        cv2.putText(panel, action[:60], (x_offset - 10, y_start + 172),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (200, 200, 200), 1)
 
 
 # =============================================================================
@@ -627,7 +847,7 @@ def main():
         alert_msg = f"[{timestamp}] {message}"
         alert_log.append(alert_msg)
         print(f"🚨 ALERT: {message}")
-        with open(OUTPUT_ALERTS, 'a') as f:
+        with open(OUTPUT_ALERTS, 'a', encoding='utf-8') as f:
             f.write(alert_msg + '\n')
     
     # Load Model
@@ -808,8 +1028,7 @@ def main():
                 tvsi_result = tvsi_integration.update(
                     current_detections=detections,
                     counted_ids=counted_ids,
-                    track_history=track_history,
-                    stgcn_anomaly=0.0
+                    track_history=track_history
                 )
                 
                 if tvsi_result is not None:
@@ -824,7 +1043,12 @@ def main():
                         'Flow': tvsi_result['window_data']['flow'],
                         'Density': tvsi_result['window_data']['avg_density'],
                         'Avg_Speed': tvsi_result['window_data']['avg_speed'],
-                        'Congestion_Detected': tvsi_result['congestion_detected']
+                        'Congestion_Detected': tvsi_result['congestion_detected'],
+                        # NEW fields
+                        'Amber_Alert': tvsi_result.get('amber_alert', False),
+                        'Time_To_Congestion': tvsi_result.get('time_to_congestion_sec'),
+                        'TVSI_Derivative': tvsi_result.get('tvsi_derivative', 0),
+                        'Suggested_Action': tvsi_result.get('suggested_action', '')
                     }
                     tvsi_results_log.append(log_entry)
                     
@@ -841,8 +1065,16 @@ def main():
                     print(f"\n{emoji} TVSI: {tvsi_result['tvsi']:.3f} | {tvsi_result['state']} | {tvsi_result['trend']}")
                     print(f"   {tvsi_result['explanation']}")
                     
+                    # AMBER ALERT logging (NEW)
+                    if tvsi_result.get('amber_alert', False):
+                        ttc = tvsi_result.get('time_to_congestion_sec')
+                        ttc_str = f" (ETA: {ttc:.0f}s)" if ttc else ""
+                        amber_msg = f"🟠 AMBER: {tvsi_result.get('amber_reason', 'Intervene now')}{ttc_str}"
+                        print(f"   {amber_msg}")
+                        print(f"   ACTION: {tvsi_result.get('suggested_action', '')}")
+                    
                     if tvsi_result['congestion_detected']:
-                        alert_msg = f"CONGESTION: {tvsi_result['state']} - {tvsi_result['explanation']}"
+                        alert_msg = f"🔴 RED ALERT: {tvsi_result['state']} - {tvsi_result['explanation']}"
                         send_alert(alert_msg)
                         congestion_events.append(log_entry)
             
